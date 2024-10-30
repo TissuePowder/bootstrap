@@ -1,0 +1,183 @@
+https://docs.zfsbootmenu.org/en/v2.3.x/guides/fedora/uefi.html
+
+
+sudo -i
+------------------
+
+source /etc/os-release
+export ID
+
+rpm -e --nodeps zfs-fuse
+dnf config-manager --disable updates
+dnf install -y https://zfsonlinux.org/fedora/zfs-release-2-5$(rpm --eval "%{dist}").noarch.rpm
+dnf install -y https://dl.fedoraproject.org/pub/fedora/linux/releases/${VERSION_ID}/Everything/x86_64/os/Packages/k/kernel-devel-$(uname -r).rpm
+dnf install -y zfs gdisk
+modprobe zfs
+
+zgenhostid -f 0x00bab10c
+
+export BOOT_DISK="/dev/nvme0n1"
+export BOOT_PART="1"
+export BOOT_DEVICE="${BOOT_DISK}p${BOOT_PART}"
+
+export POOL_DISK="/dev/nvme0n1"
+export POOL_PART="2"
+export POOL_DEVICE="${POOL_DISK}p${POOL_PART}"
+
+zpool labelclear -f "$POOL_DISK"
+
+wipefs -a "$POOL_DISK"
+wipefs -a "$BOOT_DISK"
+
+sgdisk --zap-all "$POOL_DISK"
+sgdisk --zap-all "$BOOT_DISK"
+
+sgdisk -n "${BOOT_PART}:1m:+512m" -t "${BOOT_PART}:ef00" "$BOOT_DISK"
+
+sgdisk -n "${POOL_PART}:0:-10m" -t "${POOL_PART}:bf00" "$POOL_DISK"
+
+zpool create -f -o ashift=12 \
+ -O compression=lz4 \
+ -O acltype=posixacl \
+ -O xattr=sa \
+ -O relatime=on \
+ -o autotrim=on \
+ -m none rpool "$POOL_DEVICE"
+ 
+zfs create -o mountpoint=none rpool/ROOT
+zfs create -o mountpoint=/ -o canmount=noauto rpool/ROOT/${ID}
+zfs create -o mountpoint=/home rpool/home
+
+zpool set bootfs=rpool/ROOT/${ID} rpool
+
+zpool export rpool
+zpool import -N -R /mnt rpool
+zfs mount rpool/ROOT/${ID}
+zfs mount rpool/home
+mount | grep mnt
+
+udevadm trigger
+
+mkdir /run/install
+mount /dev/mapper/live-base /run/install
+
+rsync -pogAXtlHrDx \
+ --stats \
+ --exclude=/boot/efi/* \
+ --exclude=/etc/machine-id \
+ --info=progress2 \
+ /run/install/ /mnt
+ 
+mv /mnt/etc/resolv.conf /mnt/etc/resolv.conf.orig
+cp -L /etc/resolv.conf /mnt/etc
+cp /etc/hostid /mnt/etc
+
+mount -t proc proc /mnt/proc
+mount -t sysfs sys /mnt/sys
+mount -B /dev /mnt/dev
+mount -t devpts pts /mnt/dev/pts
+
+hwclock --systohc
+systemctl enable systemd-timesyncd --root=/mnt
+
+chroot /mnt /bin/bash
+
+cat << EOF > /etc/dracut.conf.d/zol.conf
+nofsck="yes"
+add_dracutmodules+=" zfs "
+omit_dracutmodules+=" btrfs "
+EOF
+
+source /etc/os-release
+
+rpm -e --nodeps zfs-fuse
+
+dnf config-manager --disable updates
+
+dnf install -y https://dl.fedoraproject.org/pub/fedora/linux/releases/${VERSION_ID}/Everything/x86_64/os/Packages/k/kernel-devel-$(uname -r).rpm
+
+dnf --releasever=${VERSION_ID} install -y \
+  https://zfsonlinux.org/fedora/zfs-release-2-5$(rpm --eval "%{dist}").noarch.rpm
+
+dnf install -y zfs zfs-dracut
+
+dnf config-manager --enable updates
+
+dracut --force --regenerate-all
+
+zfs set org.zfsbootmenu:commandline="quiet rhgb" rpool/ROOT
+
+mkfs.vfat -F32 "$BOOT_DEVICE"
+
+cat << EOF >> /etc/fstab
+$( blkid | grep "$BOOT_DEVICE" | cut -d ' ' -f 2 ) /boot/efi vfat defaults 0 0
+EOF
+
+mkdir -p /boot/efi
+mount /boot/efi
+
+dnf install -y \
+  systemd-boot-unsigned \
+  perl-YAML-PP \
+  perl-Sort-Versions \
+  perl-boolean \
+  git \
+  fzf \
+  mbuffer \
+  kexec-tools
+  
+mkdir -p /usr/local/src/zfsbootmenu
+cd /usr/local/src/zfsbootmenu
+curl -L https://get.zfsbootmenu.org/source | tar -zxv --strip-components=1 -f -
+make core dracut
+
+
+/etc/zfsbootmenu/config.yaml
+---------------------
+Global:
+  ManageImages: true
+  BootMountPoint: /boot/efi
+Components:
+   Enabled: false
+EFI:
+  ImageDir: /boot/efi/EFI/zbm
+  Versions: false
+  Enabled: true
+Kernel:
+  CommandLine: quiet loglevel=0
+  
+---------------------
+
+generate-zbm
+
+mount -t efivarfs efivarfs /sys/firmware/efi/efivars
+
+efibootmgr -c -d "$BOOT_DISK" -p "$BOOT_PART" \
+  -L "ZFSBootMenu (Backup)" \
+  -l '\EFI\ZBM\VMLINUZ-BACKUP.EFI'
+
+efibootmgr -c -d "$BOOT_DISK" -p "$BOOT_PART" \
+  -L "ZFSBootMenu" \
+  -l '\EFI\ZBM\VMLINUZ.EFI'
+  
+---------------
+
+setenforce 0
+passwd
+useradd -m shimi
+passwd shimi
+
+echo "desktop" > /etc/hostname
+
+
+fixfiles -F onboot
+
+---------------
+
+mv /etc/resolv.conf.orig /etc/resolv.conf
+exit
+
+umount -n -R /mnt
+
+zpool export rpool
+reboot
